@@ -7,7 +7,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 
-from bot.handlers import router
+from handlers import router
 from bot.scheduler import setup_scheduler
 from config import TELEGRAM_BOT_TOKEN, TRADER_CHAT_ID
 from storage.db import init_db
