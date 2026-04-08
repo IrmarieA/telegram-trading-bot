@@ -21,9 +21,7 @@ app = Flask(__name__)
 
 BOT: Optional[Bot] = None
 CHAT_ID: Optional[str | int] = None
-
-# Serialize asyncio.run() sends from Flask worker threads (each run uses its own loop).
-_run_send_lock = threading.Lock()
+EVENT_LOOP: Optional[asyncio.AbstractEventLoop] = None
 
 # Initial send + 2 retries; delay between attempts (seconds).
 _MAX_SEND_ATTEMPTS = 3
@@ -199,7 +197,7 @@ def _build_message(data: dict[str, Any]) -> str:
     )
 
 
-async def _send_telegram(message: str) -> None:
+async def _send_message_async(message: str) -> None:
     if BOT is None or CHAT_ID is None:
         return
     chat = int(CHAT_ID) if not isinstance(CHAT_ID, int) else CHAT_ID
@@ -211,7 +209,7 @@ async def _send_telegram_with_retries(message: str) -> None:
     for attempt in range(1, _MAX_SEND_ATTEMPTS + 1):
         logger.info("Telegram send attempt %s/%s", attempt, _MAX_SEND_ATTEMPTS)
         try:
-            await _send_telegram(message)
+            await _send_message_async(message)
             if attempt > 1:
                 logger.info(
                     "Telegram send succeeded on attempt %s/%s",
@@ -242,38 +240,31 @@ async def _send_telegram_with_retries(message: str) -> None:
 
 def _schedule_telegram_send(message: str) -> None:
     """
-    Queue Telegram send with retries without blocking the HTTP response.
-
-    If a loop is already running in this thread, schedule with create_task.
-    Otherwise run asyncio.run in a daemon thread (under a lock) so the Flask handler
-    returns immediately.
+    Schedule Telegram send on the bot's main asyncio loop (set from main.py as EVENT_LOOP).
+    Flask runs in worker threads; enqueue work onto the loop thread with call_soon_threadsafe,
+    then create_task there so all awaits run on that loop.
     """
+    if BOT is None or CHAT_ID is None or EVENT_LOOP is None:
+        logger.warning(
+            "Webhook received but BOT, CHAT_ID, or EVENT_LOOP is not configured; skipping send"
+        )
+        return
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop is not None and loop.is_running():
+    def _enqueue_on_loop() -> None:
         task = asyncio.create_task(_send_telegram_with_retries(message))
 
         def _on_done(t: asyncio.Task[None]) -> None:
             try:
                 t.result()
             except Exception:
-                logger.exception("Unexpected error in Telegram send task")
+                logger.exception("Telegram send task failed on event loop")
 
         task.add_done_callback(_on_done)
-        return
 
-    def _run_in_thread() -> None:
-        with _run_send_lock:
-            try:
-                asyncio.run(_send_telegram_with_retries(message))
-            except Exception:
-                logger.exception("Unexpected error while running Telegram send in background thread")
-
-    threading.Thread(target=_run_in_thread, daemon=True).start()
+    try:
+        EVENT_LOOP.call_soon_threadsafe(_enqueue_on_loop)
+    except Exception:
+        logger.exception("Failed to schedule Telegram send on event loop")
 
 
 @app.route("/webhook", methods=["POST"])

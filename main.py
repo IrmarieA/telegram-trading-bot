@@ -35,6 +35,7 @@ async def main() -> None:
 
     chat_id = TRADER_CHAT_ID.strip() if TRADER_CHAT_ID else ""
     loop = asyncio.get_running_loop()
+    webhook.EVENT_LOOP = loop
     scheduler = setup_scheduler(bot, chat_id, event_loop=loop)
     scheduler.start()
     logger.info("AsyncIOScheduler started on the same event loop as aiogram polling")
