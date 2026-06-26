@@ -16,6 +16,21 @@ DEFAULT_PERIOD = config.YFINANCE_PERIOD
 
 EXPECTED_OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
+YFINANCE_SYMBOL_BY_PAIR = {
+    "EURUSD": "EURUSD=X",
+    "XAUUSD": "GC=F",
+    "GOLD": "GC=F",
+    "NAS100": "NQ=F",
+    "NASDAQ100": "NQ=F",
+    "US100": "NQ=F",
+    "US30": "YM=F",
+    "DOW30": "YM=F",
+    "SPX500": "ES=F",
+    "US500": "ES=F",
+    "BTCUSD": "BTC-USD",
+    "ETHUSD": "ETH-USD",
+}
+
 
 def _normalize_ohlcv(df: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     """
@@ -84,6 +99,42 @@ def fetch_ohlcv(symbol: str, *, interval: str | None = None, period: str | None 
     if normalized.empty:
         logger.warning("No usable OHLCV data after normalization for %s", symbol)
     return normalized
+
+
+def normalize_pair_key(pair: str) -> str:
+    """Normalize common pair formats such as EUR/USD or xauusd."""
+
+    return str(pair or "").strip().upper().replace("/", "").replace(" ", "")
+
+
+def yfinance_symbol_for_pair(pair: str) -> str:
+    """Map journal pair names to yfinance symbols."""
+
+    key = normalize_pair_key(pair)
+    if key in YFINANCE_SYMBOL_BY_PAIR:
+        return YFINANCE_SYMBOL_BY_PAIR[key]
+    if key.endswith("USD") and len(key) == 6:
+        return f"{key}=X"
+    return key
+
+
+def fetch_latest_price(pair: str) -> float | None:
+    """Fetch the latest close for a journal pair using yfinance."""
+
+    symbol = yfinance_symbol_for_pair(pair)
+    df = fetch_ohlcv(symbol, interval="1m", period="1d")
+    if df.empty:
+        df = fetch_ohlcv(symbol, interval=DEFAULT_INTERVAL, period="5d")
+    if df.empty or "Close" not in df.columns:
+        return None
+    close = df["Close"].dropna()
+    if close.empty:
+        return None
+    try:
+        return float(close.iloc[-1])
+    except (TypeError, ValueError):
+        logger.warning("Latest close for %s/%s could not be converted to float", pair, symbol)
+        return None
 
 
 def fetch_eurusd_x_and_gc_ohlcv(
