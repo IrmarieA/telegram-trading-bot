@@ -16,11 +16,12 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from ai.analyst import analyze_all_pairs
 from market.calendar import fetch_todays_economic_events, get_high_impact_events
+from market.data_fetcher import fetch_latest_price
 
 import aiosqlite
 
 from handlers import FRIENDLY_DATA_ERROR, _display_pair, _format_brief_message, _load_market_pipeline
-from storage.db import DB_PATH
+from storage.db import DB_PATH, close_trade, get_all_open_trades, get_daily_report_stats
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,139 @@ async def _job_news_warning(bot: Bot, trader_chat_id: str) -> None:
     await _broadcast_alerts(bot, msg, trader_chat_id)
 
 
+def _trade_exit_signal(trade: Dict[str, Any], price: float) -> Optional[tuple[str, float]]:
+    direction = str(trade.get("direction") or "").strip().upper()
+    try:
+        stop_loss = float(trade.get("stop_loss"))
+        target = float(trade.get("target"))
+    except (TypeError, ValueError):
+        return None
+
+    if direction == "BUY":
+        if price >= target:
+            return "WIN", target
+        if price <= stop_loss:
+            return "LOSS", stop_loss
+    elif direction == "SELL":
+        if price <= target:
+            return "WIN", target
+        if price >= stop_loss:
+            return "LOSS", stop_loss
+    return None
+
+
+async def _job_trade_monitor() -> None:
+    logger.info("Scheduler job running: trade_monitor")
+    try:
+        trades = await get_all_open_trades()
+    except Exception:
+        logger.exception("Trade monitor: failed to load open journal trades")
+        return
+
+    if not trades:
+        logger.debug("Trade monitor: no open trades")
+        return
+
+    prices: Dict[str, Optional[float]] = {}
+    for trade in trades:
+        pair = str(trade.get("pair") or "").strip().upper()
+        if not pair:
+            continue
+        if pair not in prices:
+            try:
+                prices[pair] = await asyncio.to_thread(fetch_latest_price, pair)
+            except Exception:
+                logger.exception("Trade monitor: failed to fetch latest price for %s", pair)
+                prices[pair] = None
+        price = prices[pair]
+        if price is None:
+            logger.warning("Trade monitor: latest price unavailable for %s", pair)
+            continue
+
+        exit_signal = _trade_exit_signal(trade, price)
+        if exit_signal is None:
+            continue
+
+        result, exit_price = exit_signal
+        try:
+            closed = await close_trade(int(trade["id"]), float(exit_price), result, ai_bias="AUTO_MONITOR")
+        except ValueError:
+            logger.info("Trade monitor: trade %s already closed or missing", trade.get("id"))
+            continue
+        except Exception:
+            logger.exception("Trade monitor: failed to close trade %s", trade.get("id"))
+            continue
+        logger.info(
+            "Trade monitor closed trade id=%s pair=%s direction=%s result=%s exit=%s",
+            closed.get("id"),
+            closed.get("pair"),
+            closed.get("direction"),
+            closed.get("result"),
+            closed.get("exit_price"),
+        )
+
+
+def _format_percent(value: float) -> str:
+    if float(value).is_integer():
+        return f"{value:.0f}%"
+    return f"{value:.1f}%"
+
+
+def _format_daily_report(stats: Dict[str, Any]) -> str:
+    lines = [
+        "📊 FX ROYALTY DAILY REPORT",
+        "",
+        f"Trades: {int(stats['trades'])}",
+        "",
+        f"Wins: {int(stats['wins'])} ✅",
+        "",
+        f"Losses: {int(stats['losses'])} ❌",
+        "",
+        f"Open: {int(stats['open'])} ⏳",
+        "",
+        f"Win Rate: {_format_percent(float(stats['win_rate']))}",
+        "",
+        "Completed Trades:",
+        "",
+    ]
+    completed = stats.get("completed") or []
+    if not completed:
+        lines.append("No completed trades today.")
+        return "\n".join(lines)
+
+    for trade in completed:
+        emoji = "✅" if trade.get("normalized_result") == "Winner" else "❌"
+        pair = str(trade.get("pair") or "—").upper()
+        direction = str(trade.get("direction") or "—").upper()
+        lines.append(f"{emoji} {pair} {direction}")
+    return "\n".join(lines)
+
+
+async def _job_daily_report(bot: Bot, trader_chat_id: str) -> None:
+    logger.info("Scheduler job running: daily_report")
+    trader_cid = _trader_chat_int(trader_chat_id)
+    if trader_cid is None:
+        logger.warning("Daily report skipped because TRADER_CHAT_ID is not configured")
+        return
+
+    now_est = datetime.now(NY_TZ)
+    try:
+        stats = await get_daily_report_stats(
+            trader_cid,
+            report_date=now_est.date(),
+            tz=NY_TZ,
+        )
+    except Exception:
+        logger.exception("Daily report: failed to build journal stats")
+        return
+
+    try:
+        await bot.send_message(trader_cid, _format_daily_report(stats))
+        logger.info("Daily report sent to TRADER_CHAT_ID=%s", trader_cid)
+    except Exception:
+        logger.exception("Daily report failed for TRADER_CHAT_ID=%s", trader_cid)
+
+
 def setup_scheduler(
     bot: Bot,
     trader_chat_id: str,
@@ -337,10 +471,23 @@ def setup_scheduler(
         id="news_warning",
         replace_existing=True,
     )
+    scheduler.add_job(
+        _job_trade_monitor,
+        IntervalTrigger(minutes=3),
+        id="trade_monitor",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _job_daily_report,
+        CronTrigger(hour=17, minute=0, timezone=NY_TZ),
+        args=[bot, tid],
+        id="daily_report",
+        replace_existing=True,
+    )
 
     logger.info(
         "Scheduler jobs registered: morning_brief, ny_open, midday(12:00 NY), "
-        "session_wrap, news_warning(30m)"
+        "session_wrap, news_warning(30m), trade_monitor(3m), daily_report(17:00 NY)"
     )
     registered_ids = [job.id for job in scheduler.get_jobs()]
     print("REGISTERED JOBS:", registered_ids)

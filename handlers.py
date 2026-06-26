@@ -24,6 +24,7 @@ from market.levels import compute_levels
 from models.schemas import MarketBrief
 from storage.db import (
     close_trade,
+    compute_trade_pips,
     get_edge_report,
     get_open_trades,
     get_stats,
@@ -474,14 +475,7 @@ def _pip_size_for_pair(pair: str) -> float:
 
 
 def _compute_pips(pair: str, direction: str, entry: float, stop_loss: float, target: float) -> Tuple[float, float]:
-    pip_size = _pip_size_for_pair(pair)
-    if direction == "BUY":
-        pips_sl = (stop_loss - entry) / pip_size
-        pips_tp = (target - entry) / pip_size
-    else:
-        pips_sl = (entry - stop_loss) / pip_size
-        pips_tp = (entry - target) / pip_size
-    return pips_sl, pips_tp
+    return compute_trade_pips(pair, direction, entry, stop_loss, target)
 
 
 @router.message(F.text == BUTTON_TODAY)
@@ -954,72 +948,23 @@ async def _my_stats(message: Message, user_id: int) -> None:
         await message.answer("No stats yet — log your first trade with 📓 Log Trade!")
         return
 
-    total_closed = int(stats["total_trades"])
+    total_trades = int(stats["total_trades"])
     open_count = int(stats["open_count"])
-
     winners = int(stats["winners"])
     losers = int(stats["losers"])
-    breakeven = int(stats["breakeven"])
     win_rate = float(stats["win_rate"])
-
-    best_trade_line = "—"
-    worst_trade_line = "—"
-    if stats.get("best_trade") is not None:
-        bp = stats.get("best_pair") or ""
-        bi = int(round(float(stats["best_trade"])))
-        best_trade_line = f"{bi:+d} pips ({_pair_short(bp)})"
-    if stats.get("worst_trade") is not None:
-        wp = stats.get("worst_pair") or ""
-        wi = int(round(float(stats["worst_trade"])))
-        worst_trade_line = f"{wi:+d} pips ({_pair_short(wp)})"
-
-    avg_rr_line = "—"
-    if stats.get("avg_rr") is not None:
-        avg_rr_line = f"1:{float(stats['avg_rr']):.1f}"
 
     lines = [
         "📈 Your Trading Stats",
         "",
-        f"Total closed: {total_closed}",
-        f"⏳ Open: {open_count}",
-        f"✅ Winners: {winners}",
-        f"❌ Losers: {losers}",
-        f"➖ Breakeven: {breakeven}",
-        f"Win rate: {win_rate:.1f}%",
+        f"Total Trades: {total_trades}",
+        f"Wins: {winners} ✅",
+        f"Losses: {losers} ❌",
+        f"Open Trades: {open_count} ⏳",
+        f"Win Rate: {win_rate:.1f}%",
         "",
-        f"Best trade: {best_trade_line}",
-        f"Worst trade: {worst_trade_line}",
-        f"Avg R:R taken: {avg_rr_line}",
-        "",
-        "💡 You're doing well. Keep following the plan.",
+        "💡 The journal is your source of truth. Keep every trade logged.",
     ]
-
-    if total_closed >= 3:
-        try:
-            edge_report = await get_edge_report(user_id)
-        except Exception:
-            logger.exception("get_edge_report failed")
-            edge_report = None
-        if edge_report:
-            lines.extend(["", "🧬 Your Edge Report", ""])
-            for reason_key, m in edge_report.items():
-                wr = float(m["win_rate"])
-                emoji = _edge_wr_emoji(wr)
-                lines.append(
-                    f"{reason_key} → {int(m['trade_count'])} trades → {wr:.1f}% win rate {emoji}"
-                )
-            insight_bullets = _edge_insight_bullets(list(edge_report.items()))
-            if insight_bullets:
-                lines.append("")
-                lines.append("💡 " + " ".join(insight_bullets))
-    else:
-        lines.extend(
-            [
-                "",
-                "🧬 Edge Report unlocks after 3 closed trades.",
-                "   Keep logging — the data builds your edge.",
-            ]
-        )
 
     await message.answer("\n".join(lines))
 

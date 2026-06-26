@@ -15,6 +15,9 @@ from typing import Any, Optional
 from aiogram import Bot
 from flask import Flask, jsonify, request
 
+from config import TRADER_CHAT_ID
+from storage.db import save_auto_trade
+
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -197,6 +200,96 @@ def _build_message(data: dict[str, Any]) -> str:
     )
 
 
+def _first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = data.get(key)
+        if value is not None and str(value).strip():
+            return value
+    return None
+
+
+def _normalize_payload_pair(value: Any) -> str:
+    raw = _safe_str(value, "")
+    if ":" in raw:
+        raw = raw.rsplit(":", 1)[1]
+    return raw.strip().upper().replace("/", "").replace(" ", "")
+
+
+def _normalize_payload_direction(value: Any) -> str:
+    raw = _safe_str(value, "").upper()
+    if raw in ("BUY", "LONG", "BULL", "BULLISH"):
+        return "BUY"
+    if raw in ("SELL", "SHORT", "BEAR", "BEARISH"):
+        return "SELL"
+    return raw
+
+
+def _parse_payload_price(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+                return None
+            return float(value)
+        sanitized = _sanitize_price_string(str(value))
+        if not sanitized:
+            return None
+        return float(Decimal(sanitized))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _auto_trade_user_id() -> Optional[int]:
+    candidate: Any = CHAT_ID if CHAT_ID is not None else TRADER_CHAT_ID
+    if candidate is None:
+        return None
+    try:
+        return int(candidate)
+    except (TypeError, ValueError):
+        logger.warning("Cannot auto-log TradingView trade: invalid TRADER_CHAT_ID/CHAT_ID=%r", candidate)
+        return None
+
+
+def _build_auto_trade(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+    user_id = _auto_trade_user_id()
+    if user_id is None:
+        logger.warning("Cannot auto-log TradingView trade: TRADER_CHAT_ID/CHAT_ID is not configured")
+        return None
+
+    pair = _normalize_payload_pair(_first_present(data, ("pair", "symbol", "ticker")))
+    direction = _normalize_payload_direction(
+        _first_present(data, ("direction", "side", "action", "order_action"))
+    )
+    entry = _parse_payload_price(_first_present(data, ("entry", "entry_price", "price")))
+    stop_loss = _parse_payload_price(_first_present(data, ("sl", "stop_loss", "stop", "stoploss")))
+    target = _parse_payload_price(_first_present(data, ("tp", "take_profit", "target", "takeprofit")))
+    reason_raw = _first_present(data, ("reason", "message", "strategy", "comment"))
+    reason = _safe_str(reason_raw, "TradingView alert")
+
+    if not pair or direction not in ("BUY", "SELL") or entry is None or stop_loss is None or target is None:
+        logger.warning(
+            "TradingView webhook accepted but not auto-logged; missing/invalid trade fields "
+            "(pair=%r direction=%r entry=%r sl=%r tp=%r)",
+            pair,
+            direction,
+            entry,
+            stop_loss,
+            target,
+        )
+        return None
+
+    return {
+        "user_id": user_id,
+        "pair": pair,
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target": target,
+        "reason": reason,
+    }
+
+
 async def _send_message_async(message: str) -> None:
     if BOT is None or CHAT_ID is None:
         return
@@ -236,6 +329,38 @@ async def _send_telegram_with_retries(message: str) -> None:
         "All %s Telegram send attempts failed for webhook message; giving up",
         _MAX_SEND_ATTEMPTS,
     )
+
+
+async def _save_auto_trade_async(trade: dict[str, Any]) -> None:
+    row_id = await save_auto_trade(trade)
+    logger.info(
+        "Auto-logged TradingView trade id=%s pair=%s direction=%s source=AUTO status=OPEN",
+        row_id,
+        trade.get("pair"),
+        trade.get("direction"),
+    )
+
+
+def _schedule_auto_trade_save(trade: dict[str, Any]) -> None:
+    if EVENT_LOOP is None:
+        logger.warning("Webhook received but EVENT_LOOP is not configured; skipping auto journal save")
+        return
+
+    def _enqueue_on_loop() -> None:
+        task = asyncio.create_task(_save_auto_trade_async(trade))
+
+        def _on_done(t: asyncio.Task[None]) -> None:
+            try:
+                t.result()
+            except Exception:
+                logger.exception("Auto journal save task failed on event loop")
+
+        task.add_done_callback(_on_done)
+
+    try:
+        EVENT_LOOP.call_soon_threadsafe(_enqueue_on_loop)
+    except Exception:
+        logger.exception("Failed to schedule auto journal save on event loop")
 
 
 def _schedule_telegram_send(message: str) -> None:
@@ -285,6 +410,10 @@ def webhook() -> tuple[Any, int]:
                 _DEDUP_WINDOW_SEC,
             )
             return jsonify({"status": "ok"}), 200
+
+        auto_trade = _build_auto_trade(payload)
+        if auto_trade is not None:
+            _schedule_auto_trade_save(auto_trade)
 
         message = _build_message(payload)
 
