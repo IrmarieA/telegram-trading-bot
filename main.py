@@ -40,15 +40,6 @@ async def main() -> None:
     scheduler.start()
     logger.info("AsyncIOScheduler started on the same event loop as aiogram polling")
 
-    if chat_id:
-        try:
-            await bot.send_message(
-                int(chat_id),
-                "🤖 Bot is online and watching the markets for you.",
-            )
-        except Exception:
-            logger.exception("Startup message to TRADER_CHAT_ID failed")
-
     webhook.BOT = bot
     webhook.CHAT_ID = int(chat_id) if chat_id else None
 

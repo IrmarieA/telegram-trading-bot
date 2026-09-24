@@ -436,42 +436,6 @@ def setup_scheduler(
     scheduler = AsyncIOScheduler(timezone=NY_TZ, event_loop=loop)
 
     scheduler.add_job(
-        _job_morning_brief,
-        CronTrigger(hour=7, minute=0, timezone=NY_TZ),
-        args=[bot, tid],
-        id="morning_brief",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        _job_ny_open,
-        CronTrigger(hour=8, minute=30, timezone=NY_TZ),
-        args=[bot, tid],
-        id="ny_open",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        _job_midday,
-        CronTrigger(hour=12, minute=0, timezone=NY_TZ),
-        args=[bot, tid],
-        id="midday",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        _job_session_wrap,
-        CronTrigger(hour=16, minute=0, timezone=NY_TZ),
-        args=[bot, tid],
-        id="session_wrap",
-        replace_existing=True,
-    )
-
-    scheduler.add_job(
-        _job_news_warning,
-        IntervalTrigger(minutes=30),
-        args=[bot, tid],
-        id="news_warning",
-        replace_existing=True,
-    )
-    scheduler.add_job(
         _job_trade_monitor,
         IntervalTrigger(minutes=3),
         id="trade_monitor",
@@ -479,7 +443,7 @@ def setup_scheduler(
     )
     scheduler.add_job(
         _job_daily_report,
-        CronTrigger(hour=17, minute=0, timezone=NY_TZ),
+        CronTrigger(hour=23, minute=59, timezone=NY_TZ),
         args=[bot, tid],
         id="daily_report",
         replace_existing=True,
